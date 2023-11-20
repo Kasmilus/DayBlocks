@@ -6,11 +6,19 @@ import "core:fmt"
 import "core:strings"
 import "core:text/scanner"
 import "core:strconv"
+import "core:thread"
+import "core:intrinsics"
 
-verb_t :: enum {PRINT_TABLE, START_TIMING, END_TIMING, HELP, QUIT, INVALID}
+/*
+Note this thing is really badly designed. It's storing data in the same format that's shown to the user (when calling "print"). 
+Not sure why I thought this was a good idea but now I can't be bothered to change that since it works fine the way it is. It's just taking up much more space than necessary and it's a bit inconvenient to edit manually.
+*/
+
+
+verb_t :: enum {PRINT_TABLE, SHOW, START_TIMING, END_TIMING, HELP, QUIT, INVALID}
 noun_t :: enum {
   NONE, INVALID,
-  YESTERDAY, WEEK, 
+  TODAY, YESTERDAY, WEEK, WORKWEEK,
   WORK, BREAK,
 }
 verbMap := map[string]verb_t { // NOTE: Why can't make it a constant?
@@ -19,9 +27,12 @@ verbMap := map[string]verb_t { // NOTE: Why can't make it a constant?
   "p" = verb_t.PRINT_TABLE,
   "draw" = verb_t.PRINT_TABLE,
   "table" = verb_t.PRINT_TABLE,
+  // Show
+  "show" = verb_t.SHOW,
+  "calc" = verb_t.SHOW,
+  "calculate" = verb_t.SHOW,
   // Start
   "start" = verb_t.START_TIMING,
-  "s" = verb_t.START_TIMING,
   "begin" = verb_t.START_TIMING,
   // End
   "end" = verb_t.END_TIMING,
@@ -36,10 +47,14 @@ verbMap := map[string]verb_t { // NOTE: Why can't make it a constant?
 }
 nounMap := map[string]noun_t { // NOTE: Why can't make it a constant?
   // Print
+  "today" = noun_t.TODAY,
+  "t" = noun_t.TODAY,
   "yesterday" = noun_t.YESTERDAY,
   "y" = noun_t.YESTERDAY,
   "week" = noun_t.WEEK,
   "w" = noun_t.WEEK,
+  "workweek" = noun_t.WORKWEEK,
+  "ww" = noun_t.WORKWEEK,
   // Start
   "work" = noun_t.WORK,
   "break" = noun_t.BREAK,
@@ -52,6 +67,13 @@ dataStore_t :: struct
 globalDataStore : dataStore_t = {}
 dataStoreFilePath : string : "./DataStore.txt"
 dataStoreVersionIdentifier : string : "\"Data Store 1.0\""
+
+update_mutex := b64(false)
+did_acquire :: proc(m: ^b64) -> (acquired: bool) {
+	res, ok := intrinsics.atomic_compare_exchange_strong(m, false, true)
+	return ok && res == false
+}
+
 main :: proc() 
 {
   //
@@ -59,10 +81,36 @@ main :: proc()
   //
   readOrCreateLog()
 
+
   //
-  // Header
+  // Start a thread for updating table every minute
   //
-  printHeader()
+  update_proc :: proc(t: ^thread.Thread) 
+  {
+    for
+    {
+      currentTable : ^table_t = getOrCreateCurrentTable()
+      updateTable(currentTable)
+
+      // Clear console
+      fmt.printf("\e[1;1H\e[2J")
+      //
+      // Header
+      //
+      printHeader()
+      //
+      // Table
+      //
+      printTable(currentTable)
+
+      time.sleep(61 * time.Second)
+    }
+  }
+  if t := thread.create(update_proc); t != nil {
+				t.init_context = context
+				t.user_index = 0
+				thread.start(t)
+			}
   
   //
   // Main loop
@@ -75,8 +123,43 @@ main :: proc()
 
     verb, noun, errorMsg := readInput()
 
+    // CLear console
+    fmt.printf("\e[1;1H\e[2J")
+
+    // 
+    // Print current time
+    //
+    timeNow := time.now()
+    h, m, _ := time.clock_from_time(timeNow)
+    fmt.printf("Current Time: %i:%i\n", h, m)
+
+    //
+    // Printing stuff
+    //
     if len(errorMsg) == 0
     {
+      loop_last_n_days :: proc(func: proc(^table_t)->[len(timedAction_t)]int, start_day: i64, end_day: i64 = 0)
+      {
+        assert(start_day >= end_day)
+        accTimes : [len(timedAction_t)]int
+        for index : i64 = start_day; index >= end_day; index -= 1
+        {
+          t := time.now()
+          t._nsec -= i64(time.Hour) * 24 * index
+          year, month, day := time.date(t)
+          times_table := func(getTableForDate(year, month, day))
+          for action in timedAction_t
+          {
+            accTimes[action] += times_table[action]
+          }
+        }
+        fmt.printf("\nTotal time (%i days): %s\n", start_day-end_day + 1, getResetColorStr())
+        for action in timedAction_t
+        {
+          fmt.printf("%s%s: %i hours, %i minutes%s\n", getActionColorStr(action), action, int(accTimes[action] / 60), accTimes[action] % 60, getResetColorStr())
+        }
+      }
+
       switch verb
       {
         case verb_t.PRINT_TABLE: 
@@ -85,22 +168,33 @@ main :: proc()
           {
             case noun_t.NONE:
               printTable(currentTable)
+            case noun_t.TODAY:
+              printTable(currentTable)
             case noun_t.YESTERDAY:
-              t := time.now()
-              t._nsec -= i64(time.Hour) * 24
-              year, month, day := time.date(t)
-              printTable(getTableForDate(year, month, day))
+              loop_last_n_days(printTable, start_day=1, end_day=1)
+            case noun_t.WORKWEEK:
+              loop_last_n_days(printTable, start_day=i64(time.weekday(time.now()))-1)
             case noun_t.WEEK:
-              year, month, day := time.date(time.now())
-              for index : i64 = 6; index >= 0; index -= 1
-              {
-                t := time.now()
-                t._nsec -= i64(time.Hour) * 24 * index
-                year, month, day := time.date(t)
-                printTable(getTableForDate(year, month, day))
-              }
+              loop_last_n_days(printTable, start_day=6)
             case:
-              fmt.printf("Can't print table with %s (use YESTERDAY or WEEK or just no params)\n", noun)
+              fmt.printf("Can't print table with %s (use TODAY/YESTERDAY/WEEK/WORKWEEK or just no params)\n", noun)
+          }
+        case verb_t.SHOW: 
+          updateTable(currentTable)
+          #partial switch(noun)
+          {
+            case noun_t.NONE:
+              showTableTimes(currentTable)
+            case noun_t.TODAY:
+              showTableTimes(currentTable)
+            case noun_t.YESTERDAY:
+              loop_last_n_days(showTableTimes, start_day=1, end_day=1)
+            case noun_t.WORKWEEK:
+              loop_last_n_days(showTableTimes, start_day=i64(time.weekday(time.now()))-1)
+            case noun_t.WEEK:
+              loop_last_n_days(showTableTimes, start_day=6)
+            case:
+              fmt.printf("Can't print table with %s (use TODAY/YESTERDAY/WEEK/WORKWEEK or just no params)\n", noun)
           }
         case verb_t.START_TIMING: 
           startTiming(currentTable, noun)
@@ -117,9 +211,7 @@ main :: proc()
     }
     else
     {
-      fmt.printf("Error!\n")
-      fmt.printf(errorMsg)
-      fmt.printf("\n")
+      fmt.printf("Error: %s\n", errorMsg)
     }
   }
 }
@@ -197,13 +289,16 @@ readInput :: proc() -> (resultVerb: verb_t, resultNoun: noun_t, errorMsg: string
   stdin := os.stdin
   read, err := os.read(stdin, data[:])
 
-  if(err != os.ERROR_NONE)
+  // NOTE: Gettting error file not found and invalid handle but everything seems to be working fine...
+  if(err != os.ERROR_NONE && err != os.ERROR_FILE_NOT_FOUND && err != os.ERROR_INVALID_HANDLE)
   {
-    fmt.printf("Read input error Error %i\n", err) // NOTE: Gettting error 6 even though everything seems to be working fine?
+    fmt.printf("Read input error Error %i\n", err) 
   }
 
   dataStr : string = strings.split_lines(string(data[:read]))[0]
   dataStr = strings.trim_prefix(dataStr, ":") // Allow colons as first character
+  dataStr = strings.trim_right_space(dataStr)
+  dataStr = strings.trim_left_space(dataStr)
   words : []string = strings.split(dataStr, " ")
   
   switch err
@@ -314,7 +409,14 @@ createNewTable :: proc() -> ^table_t
 
 updateTable :: proc(table : ^table_t)
 {
+  for !did_acquire(&update_mutex) {  }
+  defer update_mutex = false
+
   if table.currentAction == timedAction_t.FREE
+  {
+    return
+  }
+  if table == nil
   {
     return
   }
@@ -382,20 +484,24 @@ endTiming :: proc(table : ^table_t)
   table.currentAction = timedAction_t.FREE
 }
 
-resetColor :: proc()
+getResetColorStr :: proc() -> string
 {
-  fmt.printf("\x1B[0m")
+  return "\x1B[0m"
 }
 
-setActionColor :: proc(action: timedAction_t)
+getActionColorStr :: proc(action: timedAction_t) -> string
 {
+  result: string = ""
+
   switch(action)
   {
-    case timedAction_t.SLEEP: fmt.printf("\x1B[34m") // Blue
-    case timedAction_t.FREE: fmt.printf("\x1B[30;1m") // Gray
-    case timedAction_t.WORK: fmt.printf("\x1B[31m") // Red
-    case timedAction_t.BREAK: fmt.printf("\x1B[33m") // Yellow
+    case timedAction_t.SLEEP: result = "\x1B[34m" // Blue
+    case timedAction_t.FREE: result = "\x1B[30;1m" // Gray
+    case timedAction_t.WORK: result = "\x1B[31m" // Red
+    case timedAction_t.BREAK: result = "\x1B[33m" // Yellow
   }
+
+  return result
 }
 
 getTableForDate :: proc(year : int, month : time.Month, day : int) -> ^table_t
@@ -411,69 +517,72 @@ getTableForDate :: proc(year : int, month : time.Month, day : int) -> ^table_t
   return nil
 }
 
-printTable :: proc(table: ^table_t)
+printTable :: proc(table: ^table_t) -> [len(timedAction_t)]int
 {
+  result : [len(timedAction_t)]int
+
   if(table == nil)
   {
     line : string = "\n#################################################################\n"
     msg : string = fmt.aprintf("No Record")
     msg = strings.center_justify(msg, len(line) - len(msg)/2, " ")
+    fmt.printf("%s\n\n%s\n\n%s", line, msg, line)
 
-    fmt.printf(line)
-    fmt.printf("\n\n%s\n\n", msg)
-    fmt.printf(line)
-
-    return
+    return result
   }
 
   // 
   // Print Table
   //
-  resetColor()
+  fmt.printf(getResetColorStr())
   printTableHeader(table)
-  for hour := 1; hour <= 24; hour += 1
+  str_builder := strings.builder_make()
+  strings.builder_grow(&str_builder, 60*24*2)  // Reserve some space for the string
+  for hour := 0; hour < 24; hour += 1
   {
-    resetColor()
-    fmt.printf(hour < 10 ? "| 0%i |" : "| %i |" , hour)
+    fmt.sbprint(&str_builder, getResetColorStr())
+    fmt.sbprintf(&str_builder, hour < 10 ? "| 0%i |" : "| %i |" , int(hour))
     for minute := 0; minute < 60; minute += 1
     {
-      resetColor()
+      fmt.sbprint(&str_builder, getResetColorStr())
       if minute == 0
       {
-        fmt.printf("[")
+        fmt.sbprint(&str_builder, "[")
       }
       else if minute % 10 == 0
       {
-        fmt.printf("] [")
+        fmt.sbprint(&str_builder, "] [")
       }
 
-      // NOTE: We index from 0 to 23 but hours we get from time lib are 1-24 (I think? never actually checked at midnight... :)
-      hourToCheck := 0
-      if hour == 0
-      {
-        hourToCheck = 23
-      }
-      else
-      {
-        hourToCheck = hour - 1
-      }
-      setActionColor(table.rows[hourToCheck][minute])
-      fmt.printf("|")
+      strings.write_string(&str_builder, getActionColorStr(table.rows[hour][minute]))
+      fmt.sbprint(&str_builder, "|")
 
-      resetColor()
+      strings.write_string(&str_builder, getResetColorStr())
       if minute  == 59
       {
-        fmt.printf("]|")
+        fmt.sbprint(&str_builder, "]|")
       }
     }
 
-    fmt.printf("\n")
+    fmt.sbprint(&str_builder, "\n")
+  }
+  fmt.println(strings.to_string(str_builder))
+
+  result = showTableTimes(table)
+  return result
+}
+
+showTableTimes :: proc(table: ^table_t) -> [len(timedAction_t)]int
+{
+  accTime : [len(timedAction_t)]int
+  if table == nil
+  {
+      return accTime
   }
 
   // 
   // Calc and Print Accumulated Time
   //
-  accTime : [len(timedAction_t)]int
   for hour := 0; hour < 24; hour += 1
   {
     for minute := 0; minute < 60; minute += 1
@@ -483,27 +592,42 @@ printTable :: proc(table: ^table_t)
     }
   }
 
-  resetColor()
   fmt.printf("\n")
-  fmt.printf("Total time:\n")
+  fmt.printf("%s\nTotal time:\n", getResetColorStr())
   for action in timedAction_t
   {
-    setActionColor(action)
-    fmt.printf("%s: %i hours, %i minutes\n", action, int(accTime[action] / 60), accTime[action] % 60)
+    fmt.printf("%s%s: %i hours, %i minutes\n", getActionColorStr(action), action, int(accTime[action] / 60), accTime[action] % 60)
   }
-  resetColor()
+  fmt.printf(getResetColorStr())
 
+  return accTime
 }
 
 printTableHeader :: proc(table: ^table_t)
 {
   headerStr : string = "| ## |     00     |     10     |     20     |     30     |     40     |     50     |"
 
-  dateStr : string = fmt.aprintf("%i %s %i", table.day, table.month, table.year)
+  table_time, ok := time.datetime_to_time(table.year, int(table.month), table.day, 0, 0, 0)
+  weekday_str := ""
+  if ok
+  {
+    weekday := time.weekday(table_time)
+    switch(weekday)
+    {
+        case time.Weekday.Sunday: weekday_str = "Sunday"
+        case time.Weekday.Monday: weekday_str = "Monday"
+        case time.Weekday.Tuesday: weekday_str = "Tuesday"
+        case time.Weekday.Wednesday: weekday_str = "Wednesday"
+        case time.Weekday.Thursday: weekday_str = "Thursday"
+        case time.Weekday.Friday: weekday_str = "Friday"
+        case time.Weekday.Saturday: weekday_str = "Saturday"
+    }
+  }
+
+  dateStr : string = fmt.aprintf("%i %s %i (%s)", table.day, table.month, table.year, weekday_str)
   dateStr = strings.center_justify(dateStr, len(headerStr) - len(dateStr)/2, " ") 
 
-  fmt.printf("\n\n%s\n\n", dateStr)
-  fmt.printf("%s\n", headerStr)
+  fmt.printf("\n\n%s\n\n%s\n", dateStr, headerStr)
 }
 
 charToTimedAction :: proc(c : u8) -> timedAction_t
@@ -644,7 +768,7 @@ updateDataStore :: proc()
     err = writeToFile(tempFileHandle)
     if(err != os.ERROR_NONE)
     {
-      fmt.printf("Failed to write DataStore file, error %i\n", err)
+      fmt.printf("Failed to write DataStoreTmp file, error %i\n", err)
       return
     }
   }
@@ -673,7 +797,7 @@ updateDataStore :: proc()
       fmt.printf("DataStore.txt does not exist, creating a new one...\n")
     }
     err := os.rename(dataStoreTempFilePath, dataStoreFilePath)
-    if(err != 1) // NOTE: Unlike other functions, 1 means success (why windows API is so bad?? this should be addressed in os package though, checking for ERROR_NONE will cause a bug)
+    if(err != 0)
     {
       fmt.printf("Failed to rename tmp file but current DataStore.txt is removed! \nPlease rename it manually. \nError: %i\n", err)
       return
